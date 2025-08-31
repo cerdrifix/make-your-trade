@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - MTG Card Database{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h1 class="mb-4">
+            <i data-feather="layers" class="me-2"></i>
+            Magic: The Gathering Card Database
+        </h1>
+        <p class="lead">Import and browse Magic: The Gathering card data from the Scryfall API</p>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card bg-primary">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <h4 class="card-title">{{ "{:,}".format(card_count) }}</h4>
+                        <p class="card-text">Cards</p>
+                    </div>
+                    <div class="align-self-center">
+                        <i data-feather="credit-card" style="width: 2rem; height: 2rem;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-success">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <h4 class="card-title">{{ "{:,}".format(set_count) }}</h4>
+                        <p class="card-text">Sets</p>
+                    </div>
+                    <div class="align-self-center">
+                        <i data-feather="package" style="width: 2rem; height: 2rem;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-info">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <h4 class="card-title">{{ "{:,}".format(artist_count) }}</h4>
+                        <p class="card-text">Artists</p>
+                    </div>
+                    <div class="align-self-center">
+                        <i data-feather="users" style="width: 2rem; height: 2rem;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-warning">
+            <div class="card-body">
+                <div class="d-flex justify-content-between">
+                    <div>
+                        <h4 class="card-title">
+                            {% if latest_import %}
+                                {{ latest_import.status.title() }}
+                            {% else %}
+                                No Import
+                            {% endif %}
+                        </h4>
+                        <p class="card-text">Import Status</p>
+                    </div>
+                    <div class="align-self-center">
+                        <i data-feather="download" style="width: 2rem; height: 2rem;"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">
+                    <i data-feather="download" class="me-2"></i>
+                    Data Import
+                </h5>
+            </div>
+            <div class="card-body">
+                <p class="card-text">Import Magic: The Gathering card data from the Scryfall API into the database.</p>
+                
+                {% if latest_import and latest_import.status == 'running' %}
+                    <div class="alert alert-info">
+                        <i data-feather="loader" class="me-2"></i>
+                        An import is currently running. 
+                        <a href="{{ url_for('import_status', import_id=latest_import.id) }}" class="alert-link">View Progress</a>
+                    </div>
+                {% else %}
+                    <div class="d-grid gap-2">
+                        <form action="{{ url_for('start_import') }}" method="POST" onsubmit="return confirm('This will import all card data from Scryfall. This may take several minutes. Continue?');">
+                            <button type="submit" class="btn btn-primary w-100">
+                                <i data-feather="download" class="me-2"></i>
+                                Start Import
+                            </button>
+                        </form>
+                        
+                        {% if card_count > 0 %}
+                            <form action="{{ url_for('update_hashes') }}" method="POST" onsubmit="return confirm('This will recalculate hashes for all existing records. Continue?');">
+                                <button type="submit" class="btn btn-outline-secondary w-100">
+                                    <i data-feather="hash" class="me-2"></i>
+                                    Update Hashes
+                                </button>
+                            </form>
+                        {% endif %}
+                    </div>
+                {% endif %}
+                
+                {% if latest_import %}
+                    <div class="mt-3">
+                        <h6>Last Import:</h6>
+                        <ul class="list-unstyled">
+                            <li><strong>Status:</strong> 
+                                <span class="badge bg-{{ 'success' if latest_import.status == 'completed' else 'warning' if latest_import.status == 'running' else 'danger' }}">
+                                    {{ latest_import.status.title() }}
+                                </span>
+                            </li>
+                            <li><strong>Started:</strong> {{ latest_import.started_at.strftime('%Y-%m-%d %H:%M:%S') if latest_import.started_at else 'N/A' }}</li>
+                            {% if latest_import.completed_at %}
+                                <li><strong>Completed:</strong> {{ latest_import.completed_at.strftime('%Y-%m-%d %H:%M:%S') }}</li>
+                            {% endif %}
+                            {% if latest_import.total_cards > 0 %}
+                                <li><strong>Cards Processed:</strong> {{ "{:,}".format(latest_import.processed_cards) }} / {{ "{:,}".format(latest_import.total_cards) }}</li>
+                            {% endif %}
+                        </ul>
+                        
+                        {% if latest_import.status in ['running', 'completed'] %}
+                            <a href="{{ url_for('import_status', import_id=latest_import.id) }}" class="btn btn-sm btn-outline-primary">
+                                <i data-feather="eye" class="me-1"></i>
+                                View Details
+                            </a>
+                        {% endif %}
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">
+                    <i data-feather="search" class="me-2"></i>
+                    Browse Data
+                </h5>
+            </div>
+            <div class="card-body">
+                <p class="card-text">Explore the imported Magic: The Gathering card data.</p>
+                
+                <div class="d-grid gap-2">
+                    <a href="{{ url_for('view_data') }}" class="btn btn-outline-primary">
+                        <i data-feather="search" class="me-2"></i>
+                        Browse Cards
+                    </a>
+                    <a href="{{ url_for('sets') }}" class="btn btn-outline-primary">
+                        <i data-feather="package" class="me-2"></i>
+                        View Sets
+                    </a>
+                    <a href="{{ url_for('artists') }}" class="btn btn-outline-primary">
+                        <i data-feather="users" class="me-2"></i>
+                        View Artists
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

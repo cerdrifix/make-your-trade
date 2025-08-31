@@ -1,0 +1,230 @@
+{% extends "base.html" %}
+
+{% block title %}Browse Cards - MTG Card Database{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h1>
+                <i data-feather="search" class="me-2"></i>
+                Browse Cards
+            </h1>
+            <a href="{{ url_for('index') }}" class="btn btn-outline-secondary">
+                <i data-feather="arrow-left" class="me-2"></i>
+                Back to Dashboard
+            </a>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-body">
+                <form method="GET" class="row g-3">
+                    <div class="col-md-6">
+                        <label for="search" class="form-label">Search Cards</label>
+                        <input type="text" class="form-control" id="search" name="search" 
+                               placeholder="Enter card name..." value="{{ search }}">
+                    </div>
+                    <div class="col-md-4">
+                        <label for="set" class="form-label">Filter by Set</label>
+                        <select class="form-select" id="set" name="set">
+                            <option value="">All Sets</option>
+                            {% for set in sets %}
+                                <option value="{{ set.id }}" {{ 'selected' if set.id == set_filter else '' }}>
+                                    {{ set.name }} ({{ set.id.upper() }})
+                                </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <label class="form-label">&nbsp;</label>
+                        <div class="d-grid">
+                            <button type="submit" class="btn btn-primary">
+                                <i data-feather="search" class="me-2"></i>
+                                Search
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if cards.items %}
+    <div class="row">
+        {% for card in cards.items %}
+            <div class="col-md-6 col-lg-4 mb-4">
+                <div class="card h-100">
+                    <div class="card-body">
+                        <h5 class="card-title">{{ card.name }}</h5>
+                        <h6 class="card-subtitle mb-2 text-muted">{{ card.type_line }}</h6>
+                        
+                        <div class="mb-2">
+                            {% if card.mana_cost %}
+                                <span class="badge bg-secondary">{{ card.mana_cost }}</span>
+                            {% endif %}
+                            {% if card.cmc is not none %}
+                                <span class="badge bg-info">CMC: {{ card.cmc|int }}</span>
+                            {% endif %}
+                        </div>
+                        
+                        {% if card.oracle_text %}
+                            <p class="card-text small">{{ card.oracle_text[:150] }}{% if card.oracle_text|length > 150 %}...{% endif %}</p>
+                        {% endif %}
+                        
+                        <div class="mt-auto">
+                            <div class="d-flex justify-content-between align-items-center">
+                                <small class="text-muted">
+                                    {% if card.set_rel %}
+                                        {{ card.set_rel.name }}
+                                    {% endif %}
+                                    {% if card.rarity %}
+                                        • {{ card.rarity.title() }}
+                                    {% endif %}
+                                </small>
+                                <a href="#" class="btn btn-sm btn-outline-primary" 
+                                   data-bs-toggle="modal" data-bs-target="#cardModal{{ loop.index }}">
+                                    <i data-feather="eye" class="me-1"></i>
+                                    View
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Card Detail Modal -->
+            <div class="modal fade" id="cardModal{{ loop.index }}" tabindex="-1">
+                <div class="modal-dialog modal-lg">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title">{{ card.name }}</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body">
+                            <div class="row">
+                                <div class="col-md-6">
+                                    <h6>Card Details</h6>
+                                    <p><strong>Type:</strong> {{ card.type_line }}</p>
+                                    {% if card.mana_cost %}
+                                        <p><strong>Mana Cost:</strong> {{ card.mana_cost }}</p>
+                                    {% endif %}
+                                    {% if card.cmc is not none %}
+                                        <p><strong>CMC:</strong> {{ card.cmc|int }}</p>
+                                    {% endif %}
+                                    {% if card.power and card.toughness %}
+                                        <p><strong>Power/Toughness:</strong> {{ card.power }}/{{ card.toughness }}</p>
+                                    {% endif %}
+                                    {% if card.loyalty %}
+                                        <p><strong>Loyalty:</strong> {{ card.loyalty }}</p>
+                                    {% endif %}
+                                    <p><strong>Rarity:</strong> {{ card.rarity.title() if card.rarity else 'Unknown' }}</p>
+                                </div>
+                                <div class="col-md-6">
+                                    <h6>Set Information</h6>
+                                    {% if card.set_rel %}
+                                        <p><strong>Set:</strong> {{ card.set_rel.name }}</p>
+                                        <p><strong>Set Code:</strong> {{ card.set_rel.id.upper() }}</p>
+                                    {% endif %}
+                                    {% if card.collector_number %}
+                                        <p><strong>Collector Number:</strong> {{ card.collector_number }}</p>
+                                    {% endif %}
+                                    {% if card.artist_rel %}
+                                        <p><strong>Artist:</strong> {{ card.artist_rel.name }}</p>
+                                    {% endif %}
+                                </div>
+                            </div>
+                            
+                            {% if card.oracle_text %}
+                                <h6>Oracle Text</h6>
+                                <p class="fst-italic">{{ card.oracle_text }}</p>
+                            {% endif %}
+                            
+                            {% if card.flavor_text %}
+                                <h6>Flavor Text</h6>
+                                <p class="text-muted"><em>{{ card.flavor_text }}</em></p>
+                            {% endif %}
+                            
+                            {% if card.legalities %}
+                                <h6>Format Legalities</h6>
+                                <div class="row">
+                                    {% for legality in card.legalities %}
+                                        <div class="col-sm-6 col-md-4 mb-1">
+                                            <span class="badge bg-{{ 'success' if legality.legality_status == 'legal' else 'warning' if legality.legality_status == 'restricted' else 'danger' }}">
+                                                {{ legality.format_name.title() }}: {{ legality.legality_status.title() }}
+                                            </span>
+                                        </div>
+                                    {% endfor %}
+                                </div>
+                            {% endif %}
+                        </div>
+                        <div class="modal-footer">
+                            {% if card.scryfall_uri %}
+                                <a href="{{ card.scryfall_uri }}" target="_blank" class="btn btn-outline-primary">
+                                    <i data-feather="external-link" class="me-2"></i>
+                                    View on Scryfall
+                                </a>
+                            {% endif %}
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        {% endfor %}
+    </div>
+    
+    <!-- Pagination -->
+    {% if cards.pages > 1 %}
+        <nav aria-label="Card pagination">
+            <ul class="pagination justify-content-center">
+                {% if cards.has_prev %}
+                    <li class="page-item">
+                        <a class="page-link" href="{{ url_for('view_data', page=cards.prev_num, search=search, set=set_filter) }}">Previous</a>
+                    </li>
+                {% endif %}
+                
+                {% for page_num in cards.iter_pages() %}
+                    {% if page_num %}
+                        {% if page_num != cards.page %}
+                            <li class="page-item">
+                                <a class="page-link" href="{{ url_for('view_data', page=page_num, search=search, set=set_filter) }}">{{ page_num }}</a>
+                            </li>
+                        {% else %}
+                            <li class="page-item active">
+                                <span class="page-link">{{ page_num }}</span>
+                            </li>
+                        {% endif %}
+                    {% else %}
+                        <li class="page-item disabled">
+                            <span class="page-link">…</span>
+                        </li>
+                    {% endif %}
+                {% endfor %}
+                
+                {% if cards.has_next %}
+                    <li class="page-item">
+                        <a class="page-link" href="{{ url_for('view_data', page=cards.next_num, search=search, set=set_filter) }}">Next</a>
+                    </li>
+                {% endif %}
+            </ul>
+        </nav>
+    {% endif %}
+{% else %}
+    <div class="row">
+        <div class="col-12">
+            <div class="alert alert-info text-center">
+                <i data-feather="info" class="me-2"></i>
+                {% if search or set_filter %}
+                    No cards found matching your search criteria. Try adjusting your filters.
+                {% else %}
+                    No cards found in the database. Import data first from the dashboard.
+                {% endif %}
+            </div>
+        </div>
+    </div>
+{% endif %}
+{% endblock %}

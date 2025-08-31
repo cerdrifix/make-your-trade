@@ -1,0 +1,7 @@
+{
+    "host": "localhost",
+    "database": "make-your-trade",
+    "user": "root",
+    "password": "Eporedia!",
+    "port": 3306
+}

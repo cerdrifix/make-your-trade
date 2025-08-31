@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+
+{% block title %}Import Status - MTG Card Database{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h1>
+                <i data-feather="download" class="me-2"></i>
+                Import Status
+            </h1>
+            <a href="{{ url_for('index') }}" class="btn btn-outline-secondary">
+                <i data-feather="arrow-left" class="me-2"></i>
+                Back to Dashboard
+            </a>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Import Progress</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <span>Status:</span>
+                        <span class="badge bg-{{ 'success' if import_record.status == 'completed' else 'warning' if import_record.status == 'running' else 'danger' if import_record.status == 'failed' else 'secondary' }}" id="status-badge">
+                            {{ import_record.status.title() }}
+                        </span>
+                    </div>
+                    
+                    {% if import_record.total_cards > 0 %}
+                        <div class="progress mb-2" style="height: 25px;">
+                            <div class="progress-bar" role="progressbar" 
+                                 style="width: {{ import_record.progress_percentage() }}%"
+                                 id="progress-bar">
+                                <span id="progress-text">{{ import_record.processed_cards }} / {{ import_record.total_cards }} ({{ import_record.progress_percentage() }}%)</span>
+                            </div>
+                        </div>
+                    {% endif %}
+                </div>
+                
+                <div class="row">
+                    <div class="col-sm-6">
+                        <strong>Started:</strong><br>
+                        <span id="started-time">{{ import_record.started_at.strftime('%Y-%m-%d %H:%M:%S') if import_record.started_at else 'N/A' }}</span>
+                    </div>
+                    <div class="col-sm-6">
+                        <strong>Completed:</strong><br>
+                        <span id="completed-time">{{ import_record.completed_at.strftime('%Y-%m-%d %H:%M:%S') if import_record.completed_at else 'In Progress...' }}</span>
+                    </div>
+                </div>
+                
+                {% if import_record.error_message %}
+                    <div class="alert alert-danger mt-3">
+                        <h6><i data-feather="alert-triangle" class="me-2"></i>Error:</h6>
+                        <p class="mb-0">{{ import_record.error_message }}</p>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">Import Details</h5>
+            </div>
+            <div class="card-body">
+                <ul class="list-unstyled">
+                    <li><strong>Import ID:</strong> {{ import_record.id }}</li>
+                    <li><strong>Total Cards:</strong> <span id="total-cards">{{ "{:,}".format(import_record.total_cards) if import_record.total_cards > 0 else 'Calculating...' }}</span></li>
+                    <li><strong>Processed:</strong> <span id="processed-cards">{{ "{:,}".format(import_record.processed_cards) }}</span></li>
+                    {% if import_record.total_cards > 0 and import_record.processed_cards > 0 %}
+                        <li><strong>Remaining:</strong> <span id="remaining-cards">{{ "{:,}".format(import_record.total_cards - import_record.processed_cards) }}</span></li>
+                    {% endif %}
+                </ul>
+                
+                {% if import_record.status == 'completed' %}
+                    <div class="d-grid gap-2 mt-3">
+                        <a href="{{ url_for('view_data') }}" class="btn btn-primary">
+                            <i data-feather="search" class="me-2"></i>
+                            Browse Imported Cards
+                        </a>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script>
+    // Auto-refresh status if import is running
+    {% if import_record.status == 'running' %}
+        startStatusPolling({{ import_record.id }});
+    {% endif %}
+</script>
+{% endblock %}
