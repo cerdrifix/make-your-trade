@@ -1,0 +1,6 @@
+psycopg2
+requests
+datetime
+typing
+tqdm
+logging

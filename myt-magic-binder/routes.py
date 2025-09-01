@@ -2,6 +2,7 @@ from flask import render_template, request, jsonify, flash, redirect, url_for
 from app import app, db
 from models import Card, Set, Artist, Legality, ImportStatus
 from data_importer import DataImporter
+from datetime import datetime
 import threading
 import logging
 
@@ -28,10 +29,10 @@ def index():
 def start_import():
     """Start the data import process in a background thread."""
     try:
-        # Check if there's already an import running
-        running_import = ImportStatus.query.filter_by(status='running').first()
-        if running_import:
-            flash('An import is already running!', 'warning')
+        # Check if there's already an import running or paused
+        active_import = ImportStatus.query.filter(ImportStatus.status.in_(['running', 'paused'])).first()
+        if active_import:
+            flash(f'An import is already {active_import.status}!', 'warning')
             return redirect(url_for('index'))
         
         # Create new import status record
@@ -127,10 +128,10 @@ def artists():
 def update_hashes():
     """Update hashes for all existing records in the database."""
     try:
-        # Check if there's already an import or hash update running
-        running_import = ImportStatus.query.filter_by(status='running').first()
-        if running_import:
-            flash('An import or hash update is already running!', 'warning')
+        # Check if there's already an import or hash update running or paused
+        active_import = ImportStatus.query.filter(ImportStatus.status.in_(['running', 'paused'])).first()
+        if active_import:
+            flash(f'An import or hash update is already {active_import.status}!', 'warning')
             return redirect(url_for('index'))
         
         # Create new import status record for hash update
@@ -151,3 +152,62 @@ def update_hashes():
         logger.error(f"Error starting hash update: {str(e)}")
         flash(f'Error starting hash update: {str(e)}', 'danger')
         return redirect(url_for('index'))
+
+@app.route('/pause_import/<int:import_id>', methods=['POST'])
+def pause_import(import_id):
+    """Pause a running import."""
+    try:
+        import_record = ImportStatus.query.get_or_404(import_id)
+        if import_record.status == 'running':
+            import_record.status = 'paused'
+            db.session.commit()
+            flash('Import paused successfully!', 'info')
+        else:
+            flash('Import is not currently running!', 'warning')
+        return redirect(url_for('import_status', import_id=import_id))
+    except Exception as e:
+        logger.error(f"Error pausing import: {str(e)}")
+        flash(f'Error pausing import: {str(e)}', 'danger')
+        return redirect(url_for('import_status', import_id=import_id))
+
+@app.route('/resume_import/<int:import_id>', methods=['POST'])
+def resume_import(import_id):
+    """Resume a paused import."""
+    try:
+        import_record = ImportStatus.query.get_or_404(import_id)
+        if import_record.status == 'paused':
+            import_record.status = 'running'
+            db.session.commit()
+            
+            # Resume import in background thread
+            importer = DataImporter()
+            thread = threading.Thread(target=importer.import_data, args=(import_record.id,))
+            thread.daemon = True
+            thread.start()
+            
+            flash('Import resumed successfully!', 'success')
+        else:
+            flash('Import is not currently paused!', 'warning')
+        return redirect(url_for('import_status', import_id=import_id))
+    except Exception as e:
+        logger.error(f"Error resuming import: {str(e)}")
+        flash(f'Error resuming import: {str(e)}', 'danger')
+        return redirect(url_for('import_status', import_id=import_id))
+
+@app.route('/cancel_import/<int:import_id>', methods=['POST'])
+def cancel_import(import_id):
+    """Cancel a running or paused import."""
+    try:
+        import_record = ImportStatus.query.get_or_404(import_id)
+        if import_record.status in ['running', 'paused']:
+            import_record.status = 'cancelled'
+            import_record.completed_at = datetime.utcnow()
+            db.session.commit()
+            flash('Import cancelled successfully!', 'info')
+        else:
+            flash('Import cannot be cancelled in its current state!', 'warning')
+        return redirect(url_for('import_status', import_id=import_id))
+    except Exception as e:
+        logger.error(f"Error cancelling import: {str(e)}")
+        flash(f'Error cancelling import: {str(e)}', 'danger')
+        return redirect(url_for('import_status', import_id=import_id))

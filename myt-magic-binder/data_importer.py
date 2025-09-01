@@ -84,6 +84,17 @@ class DataImporter:
                 # Process cards in batches for hash updates
                 processed = 0
                 for i in range(0, total_cards, self.batch_size):
+                    # Check if hash update was paused or cancelled
+                    db.session.refresh(import_record)
+                    if import_record.status == 'paused':
+                        logger.info("Hash update paused by user")
+                        return
+                    elif import_record.status == 'cancelled':
+                        logger.info("Hash update cancelled by user")
+                        import_record.completed_at = datetime.utcnow()
+                        db.session.commit()
+                        return
+                    
                     batch = all_cards[i:i + self.batch_size]
                     
                     for card in batch:
@@ -214,6 +225,17 @@ class DataImporter:
             # Process cards in batches
             processed = 0
             for i in range(0, total_cards, self.batch_size):
+                # Check if import was paused or cancelled
+                db.session.refresh(import_record)
+                if import_record.status == 'paused':
+                    logger.info("Import paused by user")
+                    return
+                elif import_record.status == 'cancelled':
+                    logger.info("Import cancelled by user")
+                    import_record.completed_at = datetime.utcnow()
+                    db.session.commit()
+                    return
+                
                 batch = data[i:i + self.batch_size]
                 self._process_batch(batch, import_record)
 

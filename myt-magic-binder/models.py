@@ -168,7 +168,7 @@ class ImportStatus(db.Model):
     id = db.Column(Integer, primary_key=True, autoincrement=True)
     started_at = db.Column(DateTime, default=datetime.utcnow)
     completed_at = db.Column(DateTime)
-    status = db.Column(String, default='pending')  # pending, running, completed, failed
+    status = db.Column(String, default='pending')  # pending, running, paused, cancelled, completed, failed
     total_cards = db.Column(Integer, default=0)
     processed_cards = db.Column(Integer, default=0)
     error_message = db.Column(Text)

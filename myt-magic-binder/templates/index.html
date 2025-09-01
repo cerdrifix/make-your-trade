@@ -100,6 +100,17 @@
                         An import is currently running. 
                         <a href="{{ url_for('import_status', import_id=latest_import.id) }}" class="alert-link">View Progress</a>
                     </div>
+                {% elif latest_import and latest_import.status == 'paused' %}
+                    <div class="alert alert-warning">
+                        <i data-feather="pause" class="me-2"></i>
+                        An import is currently paused. 
+                        <a href="{{ url_for('import_status', import_id=latest_import.id) }}" class="alert-link">Resume Import</a>
+                    </div>
+                {% elif latest_import and latest_import.status == 'cancelled' %}
+                    <div class="alert alert-secondary">
+                        <i data-feather="x" class="me-2"></i>
+                        The last import was cancelled.
+                    </div>
                 {% else %}
                     <div class="d-grid gap-2">
                         <form action="{{ url_for('start_import') }}" method="POST" onsubmit="return confirm('This will import all card data from Scryfall. This may take several minutes. Continue?');">
@@ -125,7 +136,7 @@
                         <h6>Last Import:</h6>
                         <ul class="list-unstyled">
                             <li><strong>Status:</strong> 
-                                <span class="badge bg-{{ 'success' if latest_import.status == 'completed' else 'warning' if latest_import.status == 'running' else 'danger' }}">
+                                <span class="badge bg-{{ 'success' if latest_import.status == 'completed' else 'warning' if latest_import.status == 'running' else 'info' if latest_import.status == 'paused' else 'secondary' if latest_import.status == 'cancelled' else 'danger' }}">
                                     {{ latest_import.status.title() }}
                                 </span>
                             </li>
