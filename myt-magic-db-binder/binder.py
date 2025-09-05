@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Magic: The Gathering Card Data Importer
+Magic: The Gathering Card Data Importer - OPTIMIZED VERSION
 Imports card data from Scryfall JSON into PostgreSQL database
 """
 
 import json
 import hashlib
 import psycopg2
+import psycopg2.extras
 import requests
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import sys
 from tqdm import tqdm
 import logging
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from psycopg2 import extensions
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,13 +29,83 @@ class MTGImporter:
         self.conn = None
         self.cursor = None
         self.import_status_id = None
+        self.existing_hashes = {}  # Cache for hash lookups
+        self.existing_artists = {}  # Cache for artist lookups
+        self.lock = threading.Lock()  # For thread safety
+
+    
+
+    def ensure_clean_transaction(self):
+        """Ensure connection is not left in an aborted/unknown transaction state."""
+        if not self.conn:
+            return
+        try:
+            status = self.conn.get_transaction_status()
+        except Exception:
+            # If we cannot get status, reconnect defensively
+            try:
+                self.disconnect_db()
+            finally:
+                self.connect_db()
+            return
+
+        # If last operation failed, the transaction is aborted until we rollback
+        if status == extensions.TRANSACTION_STATUS_INERROR:
+            try:
+                self.conn.rollback()
+            except Exception:
+                # If rollback itself fails, reconnect
+                try:
+                    self.disconnect_db()
+                finally:
+                    self.connect_db()
+                return
+
+        # Unknown means libpq can't determine it (e.g., connection issues)
+        elif status == extensions.TRANSACTION_STATUS_UNKNOWN:
+            try:
+                self.disconnect_db()
+            finally:
+                self.connect_db()
+            return
+
+        # If we reconnected, refresh the cursor
+        if self.cursor is None or self.cursor.closed:
+            self.cursor = self.conn.cursor()
+
         
     def connect_db(self):
         """Establish database connection"""
         try:
             self.conn = psycopg2.connect(**self.db_config)
             self.cursor = self.conn.cursor()
-            logger.info("✓ Database connection established")
+            # Optimize connection for bulk operations
+            self.conn.autocommit = False
+            
+            # Ensure we start with a clean transaction state
+            self.conn.rollback()
+            
+            # Apply optimizations based on PostgreSQL version
+            try:
+                self.cursor.execute("SET synchronous_commit = off")
+                self.cursor.execute("SET wal_buffers = 16MB")
+                self.cursor.execute("SET commit_delay = 1000")
+                self.cursor.execute("SET commit_siblings = 10")
+                
+                # For PostgreSQL 9.5+ use max_wal_size instead of checkpoint_segments
+                self.cursor.execute("SHOW server_version_num")
+                version_num = int(self.cursor.fetchone()[0])
+                
+                if version_num >= 90500:  # PostgreSQL 9.5+
+                    self.cursor.execute("SET max_wal_size = 4GB")
+                else:
+                    self.cursor.execute("SET checkpoint_segments = 32")
+                    
+                logger.info("✓ Database connection established with optimizations")
+            except Exception as opt_e:
+                logger.warning(f"⚠️  Some optimizations failed (this is usually OK): {opt_e}")
+                logger.info("✓ Database connection established")
+                
         except Exception as e:
             logger.error(f"✗ Failed to connect to database: {e}")
             sys.exit(1)
@@ -43,6 +117,30 @@ class MTGImporter:
         if self.conn:
             self.conn.close()
         logger.info("✓ Database connection closed")
+    
+    def load_existing_hashes(self):
+        """Pre-load all existing card hashes for faster comparison"""
+        logger.info("📋 Loading existing card hashes...")
+        self.ensure_clean_transaction()
+        try:
+            self.cursor.execute("SELECT id, data_hash FROM card")
+            self.existing_hashes = dict(self.cursor.fetchall())
+            logger.info(f"✓ Loaded {len(self.existing_hashes):,} existing card hashes")
+        except Exception as e:
+            logger.error(f"✗ Failed to load existing hashes: {e}")
+            self.existing_hashes = {}
+    
+    def load_existing_artists(self):
+        """Pre-load all existing artists for faster lookup"""
+        logger.info("🎨 Loading existing artists...")
+        self.ensure_clean_transaction()
+        try:
+            self.cursor.execute("SELECT name, id FROM artist")
+            self.existing_artists = dict(self.cursor.fetchall())
+            logger.info(f"✓ Loaded {len(self.existing_artists):,} existing artists")
+        except Exception as e:
+            logger.error(f"✗ Failed to load existing artists: {e}")
+            self.existing_artists = {}
     
     def calculate_hash(self, card_data: Dict[str, Any]) -> str:
         """Calculate SHA-256 hash of card data for change detection"""
@@ -90,68 +188,167 @@ class MTGImporter:
             logger.error(f"✗ Failed to update import status: {e}")
     
     def card_needs_update(self, card_id: str, data_hash: str) -> bool:
-        """Check if card needs to be updated based on hash comparison"""
-        try:
-            self.cursor.execute(
-                "SELECT data_hash FROM card WHERE id = %s",
-                (card_id,)
-            )
-            result = self.cursor.fetchone()
-            
-            if result is None:
-                return True  # Card doesn't exist, needs insert
-            
-            return result[0] != data_hash  # Compare hashes
-            
-        except Exception as e:
-            logger.error(f"✗ Error checking card hash for {card_id}: {e}")
-            return True  # Assume needs update on error
+        """Check if card needs to be updated based on hash comparison (using cache)"""
+        existing_hash = self.existing_hashes.get(card_id)
+        if existing_hash is None:
+            return True  # Card doesn't exist, needs insert
+        return existing_hash != data_hash  # Compare hashes
     
-    def get_or_create_artist(self, artist_name: str) -> Optional[int]:
-        """Get existing artist ID or create new artist"""
+    def get_or_create_artist_cached(self, artist_name: str) -> Optional[int]:
+        """Get existing artist ID or create new artist (using cache)"""
         if not artist_name:
             return None
-            
+        
+        # Check cache first
+        if artist_name in self.existing_artists:
+            return self.existing_artists[artist_name]
+        
+        # Not in cache, need to create
         try:
-            # Try to get existing artist
+            self.cursor.execute(
+                "INSERT INTO artist (name) VALUES (%s) RETURNING id",
+                (artist_name,)
+            )
+            artist_id = self.cursor.fetchone()[0]
+            
+            # Update cache
+            self.existing_artists[artist_name] = artist_id
+            return artist_id
+            
+        except psycopg2.IntegrityError:
+            # Artist was created by another process, try to fetch
+            self.conn.rollback()
             self.cursor.execute(
                 "SELECT id FROM artist WHERE name = %s",
                 (artist_name,)
             )
             result = self.cursor.fetchone()
-            
             if result:
-                return result[0]
-            
-            # Create new artist
-            self.cursor.execute(
-                "INSERT INTO artist (name) VALUES (%s) RETURNING id",
-                (artist_name,)
-            )
-            return self.cursor.fetchone()[0]
-            
+                artist_id = result[0]
+                self.existing_artists[artist_name] = artist_id
+                return artist_id
+            return None
         except Exception as e:
             logger.error(f"✗ Error handling artist '{artist_name}': {e}")
             return None
     
-    def insert_or_update_set(self, card_data: Dict[str, Any]):
-        """Insert or update set information"""
+    def prepare_card_batch(self, cards_batch: List[Dict[str, Any]]) -> Tuple[List, List, List]:
+        """Prepare batch data for bulk operations"""
+        cards_to_upsert = []
+        sets_to_upsert = []
+        related_data = []
+        
+        seen_sets = set()
+        
+        for card_data in cards_batch:
+            try:
+                data_hash = self.calculate_hash(card_data)
+                card_id = card_data.get('id')
+                
+                # Only process if card needs update
+                if not self.card_needs_update(card_id, data_hash):
+                    continue
+                
+                # Get or create artist
+                artist_id = self.get_or_create_artist_cached(card_data.get('artist'))
+                
+                # Prepare set data (avoid duplicates in batch)
+                set_id = card_data.get('set')
+                if set_id and set_id not in seen_sets:
+                    seen_sets.add(set_id)
+                    set_data = (
+                        set_id,
+                        card_data.get('set_name'),
+                        card_data.get('set_type'),
+                        card_data.get('released_at'),
+                        card_data.get('digital', False),
+                        card_data.get('scryfall_set_uri'),
+                        card_data.get('set_uri'),
+                        card_data.get('set_search_uri')
+                    )
+                    sets_to_upsert.append(set_data)
+                
+                # Prepare card data
+                card_fields = (
+                    card_id,
+                    card_data.get('oracle_id'),
+                    json.dumps(card_data.get('multiverse_ids', [])),
+                    card_data.get('mtgo_id'),
+                    card_data.get('mtgo_foil_id'),
+                    card_data.get('tcgplayer_id'),
+                    card_data.get('cardmarket_id'),
+                    card_data.get('name'),
+                    card_data.get('lang'),
+                    card_data.get('released_at'),
+                    card_data.get('uri'),
+                    card_data.get('scryfall_uri'),
+                    card_data.get('layout'),
+                    card_data.get('image_status'),
+                    json.dumps(card_data.get('image_uris', {})),
+                    card_data.get('mana_cost'),
+                    card_data.get('cmc'),
+                    card_data.get('type_line'),
+                    card_data.get('oracle_text'),
+                    card_data.get('flavor_text'),
+                    card_data.get('power'),
+                    card_data.get('toughness'),
+                    card_data.get('loyalty'),
+                    card_data.get('set'),
+                    card_data.get('set_name'),
+                    card_data.get('set_type'),
+                    card_data.get('set_uri'),
+                    card_data.get('set_search_uri'),
+                    card_data.get('scryfall_set_uri'),
+                    card_data.get('rulings_uri'),
+                    card_data.get('prints_search_uri'),
+                    card_data.get('collector_number'),
+                    card_data.get('digital', False),
+                    card_data.get('rarity'),
+                    artist_id,
+                    card_data.get('illustration_id'),
+                    card_data.get('border_color'),
+                    card_data.get('frame'),
+                    json.dumps(card_data.get('frame_effects', [])),
+                    card_data.get('security_stamp'),
+                    card_data.get('full_art', False),
+                    card_data.get('textless', False),
+                    card_data.get('booster', False),
+                    card_data.get('story_spotlight', False),
+                    json.dumps(card_data.get('prices', {})),
+                    json.dumps(card_data.get('purchase_uris', {})),
+                    json.dumps(card_data.get('related_uris', {})),
+                    data_hash
+                )
+                cards_to_upsert.append(card_fields)
+                
+                # Prepare related data
+                related_data.append({
+                    'card_id': card_id,
+                    'colors': card_data.get('colors', []),
+                    'color_identity': card_data.get('color_identity', []),
+                    'type_names': card_data.get('type_names', []),
+                    'subtypes': card_data.get('subtypes', []),
+                    'supertypes': card_data.get('supertypes', []),
+                    'legalities': card_data.get('legalities', {})
+                })
+                
+            except Exception as e:
+                logger.error(f"✗ Error preparing card data: {e}")
+                continue
+        
+        return cards_to_upsert, sets_to_upsert, related_data
+    
+    def bulk_upsert_sets(self, sets_data: List):
+        """Bulk upsert sets using execute_values"""
+        if not sets_data:
+            return
+        
         try:
-            set_data = {
-                'id': card_data.get('set'),
-                'name': card_data.get('set_name'),
-                'set_type': card_data.get('set_type'),
-                'released_at': card_data.get('released_at'),
-                'digital': card_data.get('digital', False),
-                'scryfall_uri': card_data.get('scryfall_set_uri'),
-                'uri': card_data.get('set_uri'),
-                'search_uri': card_data.get('set_search_uri')
-            }
-            
-            # Use UPSERT (INSERT ... ON CONFLICT)
-            self.cursor.execute("""
+            psycopg2.extras.execute_values(
+                self.cursor,
+                """
                 INSERT INTO "set" (id, name, set_type, released_at, digital, scryfall_uri, uri, search_uri)
-                VALUES (%(id)s, %(name)s, %(set_type)s, %(released_at)s, %(digital)s, %(scryfall_uri)s, %(uri)s, %(search_uri)s)
+                VALUES %s
                 ON CONFLICT (id) DO UPDATE SET
                     name = EXCLUDED.name,
                     set_type = EXCLUDED.set_type,
@@ -160,74 +357,24 @@ class MTGImporter:
                     scryfall_uri = EXCLUDED.scryfall_uri,
                     uri = EXCLUDED.uri,
                     search_uri = EXCLUDED.search_uri
-            """, set_data)
-            
+                """,
+                sets_data,
+                template=None,
+                page_size=1000
+            )
         except Exception as e:
-            logger.error(f"✗ Error inserting/updating set: {e}")
+            logger.error(f"✗ Error bulk upserting sets: {e}")
+            raise
     
-    def insert_card(self, card_data: Dict[str, Any], data_hash: str):
-        """Insert or update card data"""
+    def bulk_upsert_cards(self, cards_data: List):
+        """Bulk upsert cards using execute_values"""
+        if not cards_data:
+            return
+        
         try:
-            # Get or create artist
-            artist_id = self.get_or_create_artist(card_data.get('artist'))
-            
-            # Insert/update set
-            self.insert_or_update_set(card_data)
-            
-            # Prepare card data
-            card_fields = {
-                'id': card_data.get('id'),
-                'oracle_id': card_data.get('oracle_id'),
-                'multiverse_ids': json.dumps(card_data.get('multiverse_ids', [])),
-                'mtgo_id': card_data.get('mtgo_id'),
-                'mtgo_foil_id': card_data.get('mtgo_foil_id'),
-                'tcgplayer_id': card_data.get('tcgplayer_id'),
-                'cardmarket_id': card_data.get('cardmarket_id'),
-                'name': card_data.get('name'),
-                'lang': card_data.get('lang'),
-                'released_at': card_data.get('released_at'),
-                'uri': card_data.get('uri'),
-                'scryfall_uri': card_data.get('scryfall_uri'),
-                'layout': card_data.get('layout'),
-                'image_status': card_data.get('image_status'),
-                'image_uris': json.dumps(card_data.get('image_uris', {})),
-                'mana_cost': card_data.get('mana_cost'),
-                'cmc': card_data.get('cmc'),
-                'type_line': card_data.get('type_line'),
-                'oracle_text': card_data.get('oracle_text'),
-                'flavor_text': card_data.get('flavor_text'),
-                'power': card_data.get('power'),
-                'toughness': card_data.get('toughness'),
-                'loyalty': card_data.get('loyalty'),
-                'set_id': card_data.get('set'),
-                'set_name': card_data.get('set_name'),
-                'set_type': card_data.get('set_type'),
-                'set_uri': card_data.get('set_uri'),
-                'set_search_uri': card_data.get('set_search_uri'),
-                'scryfall_set_uri': card_data.get('scryfall_set_uri'),
-                'rulings_uri': card_data.get('rulings_uri'),
-                'prints_search_uri': card_data.get('prints_search_uri'),
-                'collector_number': card_data.get('collector_number'),
-                'digital': card_data.get('digital', False),
-                'rarity': card_data.get('rarity'),
-                'artist_id': artist_id,
-                'illustration_id': card_data.get('illustration_id'),
-                'border_color': card_data.get('border_color'),
-                'frame': card_data.get('frame'),
-                'frame_effects': json.dumps(card_data.get('frame_effects', [])),
-                'security_stamp': card_data.get('security_stamp'),
-                'full_art': card_data.get('full_art', False),
-                'textless': card_data.get('textless', False),
-                'booster': card_data.get('booster', False),
-                'story_spotlight': card_data.get('story_spotlight', False),
-                'prices': json.dumps(card_data.get('prices', {})),
-                'purchase_uris': json.dumps(card_data.get('purchase_uris', {})),
-                'related_uris': json.dumps(card_data.get('related_uris', {})),
-                'data_hash': data_hash
-            }
-            
-            # Insert/update card
-            self.cursor.execute("""
+            psycopg2.extras.execute_values(
+                self.cursor,
+                """
                 INSERT INTO card (
                     id, oracle_id, multiverse_ids, mtgo_id, mtgo_foil_id, tcgplayer_id, cardmarket_id,
                     name, lang, released_at, uri, scryfall_uri, layout, image_status, image_uris,
@@ -237,19 +384,8 @@ class MTGImporter:
                     illustration_id, border_color, frame, frame_effects, security_stamp,
                     full_art, textless, booster, story_spotlight, prices, purchase_uris,
                     related_uris, data_hash
-                ) VALUES (
-                    %(id)s, %(oracle_id)s, %(multiverse_ids)s, %(mtgo_id)s, %(mtgo_foil_id)s,
-                    %(tcgplayer_id)s, %(cardmarket_id)s, %(name)s, %(lang)s, %(released_at)s,
-                    %(uri)s, %(scryfall_uri)s, %(layout)s, %(image_status)s, %(image_uris)s,
-                    %(mana_cost)s, %(cmc)s, %(type_line)s, %(oracle_text)s, %(flavor_text)s,
-                    %(power)s, %(toughness)s, %(loyalty)s, %(set_id)s, %(set_name)s, %(set_type)s,
-                    %(set_uri)s, %(set_search_uri)s, %(scryfall_set_uri)s, %(rulings_uri)s,
-                    %(prints_search_uri)s, %(collector_number)s, %(digital)s, %(rarity)s,
-                    %(artist_id)s, %(illustration_id)s, %(border_color)s, %(frame)s,
-                    %(frame_effects)s, %(security_stamp)s, %(full_art)s, %(textless)s,
-                    %(booster)s, %(story_spotlight)s, %(prices)s, %(purchase_uris)s,
-                    %(related_uris)s, %(data_hash)s
-                ) ON CONFLICT (id) DO UPDATE SET
+                ) VALUES %s
+                ON CONFLICT (id) DO UPDATE SET
                     oracle_id = EXCLUDED.oracle_id,
                     multiverse_ids = EXCLUDED.multiverse_ids,
                     mtgo_id = EXCLUDED.mtgo_id,
@@ -297,72 +433,148 @@ class MTGImporter:
                     purchase_uris = EXCLUDED.purchase_uris,
                     related_uris = EXCLUDED.related_uris,
                     data_hash = EXCLUDED.data_hash
-            """, card_fields)
-            
-            # Handle related data (colors, types, legalities, etc.)
-            self.insert_card_related_data(card_data)
-            
+                """,
+                cards_data,
+                template=None,
+                page_size=500
+            )
         except Exception as e:
-            logger.error(f"✗ Error inserting card '{card_data.get('name', 'Unknown')}': {e}")
+            logger.error(f"✗ Error bulk upserting cards: {e}")
             raise
     
-    def insert_card_related_data(self, card_data: Dict[str, Any]):
-        """Insert card colors, types, subtypes, supertypes, and legalities"""
-        card_id = card_data.get('id')
+    def bulk_insert_related_data(self, related_data_list: List):
+        """Bulk insert card-related data"""
+        if not related_data_list:
+            return
         
         try:
-            # Clear existing related data
-            tables = ['card_colors', 'card_color_identity', 'card_types', 'card_subtypes', 'card_supertypes', 'legality']
-            for table in tables:
-                self.cursor.execute(f"DELETE FROM {table} WHERE card_id = %s", (card_id,))
+            # Collect all related data for bulk operations
+            colors_data = []
+            color_identity_data = []
+            types_data = []
+            subtypes_data = []
+            supertypes_data = []
+            legalities_data = []
             
-            # Insert colors
-            for color in card_data.get('colors', []):
-                self.cursor.execute(
-                    "INSERT INTO card_colors (card_id, color) VALUES (%s, %s)",
-                    (card_id, color)
+            card_ids = [data['card_id'] for data in related_data_list]
+            
+            # First, delete existing related data for these cards
+            if card_ids:
+                card_ids_tuple = tuple(card_ids)
+                tables = ['card_colors', 'card_color_identity', 'card_types', 'card_subtypes', 'card_supertypes', 'legality']
+                for table in tables:
+                    self.cursor.execute(f"DELETE FROM {table} WHERE card_id = ANY(%s)", (card_ids,))
+            
+            # Prepare bulk data
+            for data in related_data_list:
+                card_id = data['card_id']
+                
+                # Colors
+                for color in data['colors']:
+                    colors_data.append((card_id, color))
+                
+                # Color identity
+                for color in data['color_identity']:
+                    color_identity_data.append((card_id, color))
+                
+                # Types
+                for type_name in data['type_names']:
+                    types_data.append((card_id, type_name))
+                
+                # Subtypes
+                for subtype in data['subtypes']:
+                    subtypes_data.append((card_id, subtype))
+                
+                # Supertypes
+                for supertype in data['supertypes']:
+                    supertypes_data.append((card_id, supertype))
+                
+                # Legalities
+                for format_name, legality_status in data['legalities'].items():
+                    legalities_data.append((card_id, format_name, legality_status))
+            
+            # Bulk insert all related data
+            if colors_data:
+                psycopg2.extras.execute_values(
+                    self.cursor,
+                    "INSERT INTO card_colors (card_id, color) VALUES %s",
+                    colors_data,
+                    page_size=1000
                 )
             
-            # Insert color identity
-            for color in card_data.get('color_identity', []):
-                self.cursor.execute(
-                    "INSERT INTO card_color_identity (card_id, color) VALUES (%s, %s)",
-                    (card_id, color)
+            if color_identity_data:
+                psycopg2.extras.execute_values(
+                    self.cursor,
+                    "INSERT INTO card_color_identity (card_id, color) VALUES %s",
+                    color_identity_data,
+                    page_size=1000
                 )
             
-            # Insert types, subtypes, supertypes
-            for type_name in card_data.get('type_names', []):
-                self.cursor.execute(
-                    "INSERT INTO card_types (card_id, type_name) VALUES (%s, %s)",
-                    (card_id, type_name)
+            if types_data:
+                psycopg2.extras.execute_values(
+                    self.cursor,
+                    "INSERT INTO card_types (card_id, type_name) VALUES %s",
+                    types_data,
+                    page_size=1000
                 )
             
-            for subtype in card_data.get('subtypes', []):
-                self.cursor.execute(
-                    "INSERT INTO card_subtypes (card_id, subtype_name) VALUES (%s, %s)",
-                    (card_id, subtype)
+            if subtypes_data:
+                psycopg2.extras.execute_values(
+                    self.cursor,
+                    "INSERT INTO card_subtypes (card_id, subtype_name) VALUES %s",
+                    subtypes_data,
+                    page_size=1000
                 )
             
-            for supertype in card_data.get('supertypes', []):
-                self.cursor.execute(
-                    "INSERT INTO card_supertypes (card_id, supertype_name) VALUES (%s, %s)",
-                    (card_id, supertype)
+            if supertypes_data:
+                psycopg2.extras.execute_values(
+                    self.cursor,
+                    "INSERT INTO card_supertypes (card_id, supertype_name) VALUES %s",
+                    supertypes_data,
+                    page_size=1000
                 )
             
-            # Insert legalities
-            legalities = card_data.get('legalities', {})
-            for format_name, legality_status in legalities.items():
-                self.cursor.execute(
-                    "INSERT INTO legality (card_id, format_name, legality_status) VALUES (%s, %s, %s)",
-                    (card_id, format_name, legality_status)
+            if legalities_data:
+                psycopg2.extras.execute_values(
+                    self.cursor,
+                    "INSERT INTO legality (card_id, format_name, legality_status) VALUES %s",
+                    legalities_data,
+                    page_size=1000
                 )
                 
         except Exception as e:
-            logger.error(f"✗ Error inserting related data for card {card_id}: {e}")
+            logger.error(f"✗ Error bulk inserting related data: {e}")
             raise
     
-    def download_and_import(self, url: str):
-        """Download JSON data and import to database"""
+    def process_batch(self, cards_batch: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """Process a batch of cards"""
+        try:
+            # Ensure clean transaction state before processing
+            self.ensure_clean_transaction()
+            
+            # Prepare batch data
+            cards_data, sets_data, related_data = self.prepare_card_batch(cards_batch)
+            
+            if not cards_data:
+                return 0, len(cards_batch)  # updated, skipped
+            
+            # Bulk operations
+            self.bulk_upsert_sets(sets_data)
+            self.bulk_upsert_cards(cards_data)
+            self.bulk_insert_related_data(related_data)
+            
+            updated = len(cards_data)
+            skipped = len(cards_batch) - updated
+            
+            return updated, skipped
+            
+        except Exception as e:
+            logger.error(f"✗ Error processing batch: {e}")
+            self.ensure_clean_transaction()
+            raise
+    
+    def download_and_import(self, url: str, batch_size: int = 1000):
+        """Download JSON data and import to database using batch processing"""
         logger.info(f"🌐 Downloading data from: {url}")
         
         try:
@@ -381,56 +593,58 @@ class MTGImporter:
             total_cards = len(cards_data)
             logger.info(f"🎴 Found {total_cards:,} cards to process")
             
+            # Load existing data for faster comparisons
+            self.load_existing_hashes()
+            self.load_existing_artists()
+            
             # Start import status tracking
             self.import_status_id = self.start_import_status(total_cards)
             
-            # Process cards with progress bar
+            # Process cards in batches
             processed = 0
-            updated = 0
-            skipped = 0
+            updated_total = 0
+            skipped_total = 0
             errors = 0
             
             with tqdm(total=total_cards, desc="Importing cards", unit="cards") as pbar:
-                for card_data in cards_data:
+                for i in range(0, total_cards, batch_size):
                     try:
-                        card_id = card_data.get('id')
-                        data_hash = self.calculate_hash(card_data)
+                        batch = cards_data[i:i + batch_size]
+                        updated, skipped = self.process_batch(batch)
                         
-                        if self.card_needs_update(card_id, data_hash):
-                            self.insert_card(card_data, data_hash)
-                            updated += 1
-                            pbar.set_postfix(updated=updated, skipped=skipped, errors=errors)
-                        else:
-                            skipped += 1
-                            pbar.set_postfix(updated=updated, skipped=skipped, errors=errors)
+                        updated_total += updated
+                        skipped_total += skipped
+                        processed += len(batch)
                         
-                        processed += 1
+                        # Commit after each batch
+                        self.conn.commit()
+                        self.update_import_status(processed)
                         
-                        # Commit every 100 cards
-                        if processed % 100 == 0:
-                            self.conn.commit()
-                            self.update_import_status(processed)
-                        
-                        pbar.update(1)
+                        pbar.set_postfix(
+                            updated=updated_total, 
+                            skipped=skipped_total, 
+                            errors=errors,
+                            batch_size=len(batch)
+                        )
+                        pbar.update(len(batch))
                         
                     except Exception as e:
                         errors += 1
-                        logger.error(f"✗ Error processing card: {e}")
-                        pbar.set_postfix(updated=updated, skipped=skipped, errors=errors)
-                        pbar.update(1)
+                        logger.error(f"✗ Error processing batch {i//batch_size + 1}: {e}")
+                        self.conn.rollback()  # Rollback failed batch
+                        pbar.update(min(batch_size, total_cards - i))
                         continue
             
-            # Final commit
-            self.conn.commit()
+            # Final status update
             self.update_import_status(processed, 'completed')
             
             # Print summary
             logger.info(f"\n✅ Import completed successfully!")
             logger.info(f"📊 Summary:")
             logger.info(f"   Total cards processed: {processed:,}")
-            logger.info(f"   Cards updated/inserted: {updated:,}")
-            logger.info(f"   Cards skipped (no changes): {skipped:,}")
-            logger.info(f"   Errors encountered: {errors:,}")
+            logger.info(f"   Cards updated/inserted: {updated_total:,}")
+            logger.info(f"   Cards skipped (no changes): {skipped_total:,}")
+            logger.info(f"   Batch errors: {errors:,}")
             
         except Exception as e:
             error_msg = f"Import failed: {e}"
@@ -452,14 +666,16 @@ def main():
     }
     
     # Data URL
-    data_url = 'https://data.scryfall.io/default-cards/default-cards-20250830211634.json'
+    # data_url = 'https://data.scryfall.io/default-cards/default-cards-20250830211634.json' # Default data set
+    data_url = 'https://data.scryfall.io/all-cards/all-cards-20250904213604.json'  # Full data set
     
     # Create importer and run
     importer = MTGImporter(db_config)
     
     try:
         importer.connect_db()
-        importer.download_and_import(data_url)
+        # Process in batches of 1000 cards (adjust as needed)
+        importer.download_and_import(data_url, batch_size=1000)
     except KeyboardInterrupt:
         logger.info("\n⚠️  Import interrupted by user")
         if importer.import_status_id:
