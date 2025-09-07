@@ -117,6 +117,18 @@ class MTGImporter:
         if self.conn:
             self.conn.close()
         logger.info("✓ Database connection closed")
+
+    
+    def get_last_update_date(self):
+        self.ensure_clean_transaction()
+        try:
+            self.cursor.execute("SELECT MAX(completed_at) FROM import_status WHERE status = 'completed'")
+            result = self.cursor.fetchone()
+            return result[0] if result and result[0] else None
+        except Exception as e:
+            logger.error(f"✗ Failed to fetch last update date: {e}")
+            return None
+
     
     def load_existing_hashes(self):
         """Pre-load all existing card hashes for faster comparison"""
@@ -664,16 +676,48 @@ def main():
         'password': '',
         'port': 5432
     }
+
+
     
     # Data URL
     # data_url = 'https://data.scryfall.io/default-cards/default-cards-20250830211634.json' # Default data set
-    data_url = 'https://data.scryfall.io/all-cards/all-cards-20250904213604.json'  # Full data set
+    # data_url = 'https://data.scryfall.io/all-cards/all-cards-20250904213604.json'  # Full data set
+    last_update_date = datetime.min  # Default to very old date if no previous update found
     
     # Create importer and run
     importer = MTGImporter(db_config)
     
     try:
         importer.connect_db()
+
+        # Check last update date
+        last_update = importer.get_last_update_date()
+        if last_update:
+            logger.info(f"🕒 Last card update in database: {last_update}")
+            last_update_date = last_update.replace(tzinfo=None)  # Ensure naive datetime for comparison
+
+
+        # 2. Call Scryfall bulk-data API
+        resp = requests.get("https://api.scryfall.com/bulk-data")
+        resp.raise_for_status()
+        bulk_data = resp.json()
+
+        # 3. Find the "All Cards" bulk data entry
+        all_cards_entry = next((entry for entry in bulk_data['data'] if entry['type'] == 'all_cards'), None)
+        if not all_cards_entry:
+            logger.error("✗ 'All Cards' bulk data entry not found")
+            sys.exit(1)
+
+        # 4. Compare updated_at timestamps
+        scryfall_updated_at = datetime.fromisoformat(all_cards_entry['updated_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+        if last_update and scryfall_updated_at <= last_update_date:
+            logger.info("✅ Database is already up-to-date with Scryfall data")
+            importer.update_import_status(1, 'completed', 'Update not needed; data is current')
+            sys.exit(0)
+
+        data_url = all_cards_entry['download_uri']
+
+
         # Process in batches of 1000 cards (adjust as needed)
         importer.download_and_import(data_url, batch_size=1000)
     except KeyboardInterrupt:
